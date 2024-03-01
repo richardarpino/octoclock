@@ -25,7 +25,7 @@ pixel_off = (0, 0, 0)
 
 # Dictionary of wifi networks Octoclock with connect to
 dict_of_wifi = {
-    "Brockenhurst92_Guest": "iwantwifinow!"
+    "ExampleSSID": "ExamplePassword!"
 }
 
 #  octopus URLs
