@@ -1,7 +1,7 @@
 import time
 import os
 import network
-from machine import Pin, SPI, RTC
+from machine import Pin, SPI
 import math
 from utime import sleep_ms
 import ntptime
@@ -96,6 +96,15 @@ def getTimeZoneOffsets():
     if offset_sign == "-":
         time_zone_info["offset_multiplier"] *= -1
     return time_zone_info
+#         If we wanted to adjust the time then this is how we could do it. Turns out to be easier to keep it on UTC and then only apply the offset when drawing the pixels
+#         print("Adjusting time using %s x %s hours %s min" % (TIME_ZONE_PARAMS["offset_multiplier"], TIME_ZONE_PARAMS["offset_hours"], TIME_ZONE_PARAMS["offset_mins"]))
+#         rtc = RTC()
+#         tlist = list(rtc.datetime())
+#         tlist[4] = tlist[4] + (TIME_ZONE_PARAMS["offset_hours"] * TIME_ZONE_PARAMS["offset_multiplier"])
+#         tlist[5] = tlist[5] + (TIME_ZONE_PARAMS["offset_mins"] * TIME_ZONE_PARAMS["offset_multiplier"])        
+#         rtc.datetime(tuple(tlist))
+#         print(rtc.datetime())
+
 
 # connectToWifi heavily influence by https://sungkhum.medium.com/robust-wifi-connection-script-for-a-esp8266-in-micropython-239c12fae0de
 # different board with different characterics but same problem I saw with very infrequent wifi usage on RP2040 (seems to be related to
@@ -229,7 +238,7 @@ while True:
 
         target_datetime = "%s-%02d-%02dT%02d:%02d:00Z" % (current_datetime[0], current_datetime[1], current_datetime[2], current_datetime[3], current_mins )
 
-        print("Target Time from data = %s (which is UTC)" % (target_datetime))
+        print("Target Time from data = %s (which is UTC), %s in cache" % (target_datetime, len(upcoming_prices)))
         
         if(len(upcoming_prices) > 0 and target_datetime != upcoming_prices[0]["valid_from"]):
             latest_price_index = min(prices_look_ahead, len(upcoming_prices))
@@ -238,7 +247,7 @@ while True:
             strip.show()
             upcoming_prices.pop(0)
             
-        if(len(upcoming_prices) < prices_look_ahead or force_redraw):
+        if((len(upcoming_prices) < prices_look_ahead and int(current_datetime[4]) in (0, 30)) or force_redraw):
             upcoming_prices = download_latest_prices(STANDARD_RATES_URL)
             redraw_prices(strip, upcoming_prices)
             
