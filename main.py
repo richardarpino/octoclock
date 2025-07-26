@@ -7,6 +7,9 @@ from utime import sleep_ms
 import ntptime
 import sys
 import machine
+import json
+import struct
+import socket
 
 # urequests - https://pypi.org/project/micropython-urequests/ (request library which support https)
 import urequests as requests
@@ -26,51 +29,50 @@ violet = (255, 125, 125)
 white = (255, 255, 255)
 pixel_off = (0, 0, 0)
 
-
-# Dictionary of wifi networks Octoclock with connect to
+# Dictionary of wifi networks Octoclock will connect to
 dict_of_wifi = {
-    "ExampleSSID": "ExamplePassword!"
+    "your_wifi_ssid": "your_password"
 }
 
-#  octopus URLs
+# Octopus URLs
 BASE_URL="https://api.octopus.energy"
-PRODUCT_CODE = "AGILE-FLEX-22-11-25"
+PRODUCT_CODE = "AGILE-24-10-01"
 TARIFF_CODE = "E-1R-%s-J" % (PRODUCT_CODE)
 TARIFF_URL = "%s/v1/products/%s/electricity-tariffs/%s" % (BASE_URL, PRODUCT_CODE, TARIFF_CODE)
 STANDARD_RATES_URL = "%s/standard-unit-rates/" % (TARIFF_URL)
-TIME_ZONE_URL = "http://worldtimeapi.org/api/timezone/Europe/London"
-TIME_ZONE_PARAMS = {}
 
-# variables used in main loop
-upcoming_prices = [] #cache of the upcoming prices
-prices_look_ahead = 16 #number of prices to display from cache, also triggers refresh when cache contains less than this number
+# Variables used in main loop
+upcoming_prices = [] # cache of the upcoming prices
+prices_look_ahead = 16 # number of prices to display from cache, also triggers refresh when cache contains less than this number
 
-# Anything that between good_price and high_price lights with a colour between red and green (orange, yellow, chartreuse) depending on the price
-# Anything lower or equal to zero lights with violet
+# Price thresholds
 amazing_price = 7.25 # blue light threshold - anything lower or equal to this lights with blue
-good_price = 14.5 #green light threshold - anything lower or equal to this lights with green
-high_price = 29 #red light threshold - anything greater or equal to this lights with red
+good_price = 14.5 # green light threshold - anything lower or equal to this lights with green
+high_price = 29 # red light threshold - anything greater or equal to this lights with red
 
+# WiFi management variables
+wlan = None
+last_wifi_check = 0
+wifi_check_interval = 300  # Check WiFi every 5 minutes instead of constantly
+last_keepalive = 0
+keepalive_interval = 300  # Send keepalive every 5 minutes
+gateway_ip = None
+wifi_retry_count = 0
+max_wifi_retries = 3
+
+# Timezone configuration
+TIMEZONE = "Europe/London"  # Change this for different locations
+TIMEZONE_API_BASE = "https://timeapi.io/api/TimeZone/zone"
+
+# Timezone handling - will be populated from API
+TIME_ZONE_PARAMS = {}
+last_timezone_update = 0
+timezone_update_interval = 86400  # Update once per day (24 hours)
 
 # Initialise neopixels
 spi = SPI(0, baudrate=10000000, polarity=1, phase=0, sck=Pin(2), mosi=Pin(3))
 ss = Pin(5, Pin.OUT)
 strip = Neopixel(24, 0, 0, "GRB")
-#strip.brightness(0.75) - needs investigating, seems to be a bit on/off but not graduated
-
-# strip.set_pixel(0, red)
-# strip.set_pixel(1, orange)
-# strip.set_pixel(2, yellow)
-# strip.set_pixel(3, chartreuse)
-# strip.set_pixel(4, green)
-# strip.set_pixel(5, cyan)
-# strip.set_pixel(6, blue)
-# strip.set_pixel(7, indigo)
-# strip.set_pixel(8, violet)
-# strip.set_pixel(9, white)
-# 
-# strip.show()
-# time.sleep(100)
 
 def displayError(pixels: Neopixel):
     pixels.fill(red)
@@ -86,176 +88,396 @@ def displayConnecting(pixels: Neopixel):
     pixels.show()
     time.sleep(2)
 
-def getTimeZoneOffsets():
-    # Patch the timezone information by getting the offset from http://worldtimeapi.org/
-    time_zone_info = requests.get(TIME_ZONE_URL).json()
-    offset_sign = time_zone_info["utc_offset"][0:1]
-    time_zone_info["offset_hours"] = int(time_zone_info["utc_offset"][2:3])
-    time_zone_info["offset_mins"] = int(time_zone_info["utc_offset"][5:6])
-    time_zone_info["offset_multiplier"] = 1
-    if offset_sign == "-":
-        time_zone_info["offset_multiplier"] *= -1
-    return time_zone_info
-#         If we wanted to adjust the time then this is how we could do it. Turns out to be easier to keep it on UTC and then only apply the offset when drawing the pixels
-#         print("Adjusting time using %s x %s hours %s min" % (TIME_ZONE_PARAMS["offset_multiplier"], TIME_ZONE_PARAMS["offset_hours"], TIME_ZONE_PARAMS["offset_mins"]))
-#         rtc = RTC()
-#         tlist = list(rtc.datetime())
-#         tlist[4] = tlist[4] + (TIME_ZONE_PARAMS["offset_hours"] * TIME_ZONE_PARAMS["offset_multiplier"])
-#         tlist[5] = tlist[5] + (TIME_ZONE_PARAMS["offset_mins"] * TIME_ZONE_PARAMS["offset_multiplier"])        
-#         rtc.datetime(tuple(tlist))
-#         print(rtc.datetime())
+def parse_timezone_offset(offset_data):
+    """Parse timezone offset from timeapi.io object format"""
+    if isinstance(offset_data, dict) and 'seconds' in offset_data:
+        total_seconds = offset_data['seconds']
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        sign = 1 if total_seconds >= 0 else -1
+        return abs(hours), abs(minutes), sign
+    
+    # Fallback to GMT if format is unexpected
+    return 0, 0, 1
 
+def fetch_timezone_data():
+    """Fetch timezone data from timeapi.io"""
+    try:
+        url = f"{TIMEZONE_API_BASE}?timeZone={TIMEZONE}"
+        response = requests.get(url)
+        
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code}")
+        
+        tz_data = response.json()
+        response.close()
+        
+        # Parse offset from timeapi.io format
+        offset_data = tz_data.get('currentUtcOffset')
+        offset_hours, offset_mins, offset_multiplier = parse_timezone_offset(offset_data)
+        
+        # Create standard UTC offset string
+        sign_str = '+' if offset_multiplier >= 0 else '-'
+        utc_offset_str = f"{sign_str}{abs(offset_hours):02d}:{abs(offset_mins):02d}"
+        
+        timezone_params = {
+            "offset_hours": offset_hours,
+            "offset_mins": offset_mins,
+            "offset_multiplier": offset_multiplier,
+            "utc_offset": utc_offset_str,
+            "dst": tz_data.get('isDayLightSavingActive', False),
+            "timezone": tz_data.get('timeZone', TIMEZONE),
+            "abbreviation": 'BST' if tz_data.get('isDayLightSavingActive', False) else 'GMT'
+        }
+        
+        print(f"Timezone updated: {timezone_params['abbreviation']} (UTC{timezone_params['utc_offset']})")
+        return timezone_params
+        
+    except Exception as e:
+        print(f"Timezone fetch failed: {e}")
+        return None
 
-# connectToWifi heavily influence by https://sungkhum.medium.com/robust-wifi-connection-script-for-a-esp8266-in-micropython-239c12fae0de
-# different board with different characterics but same problem I saw with very infrequent wifi usage on RP2040 (seems to be related to
-# keeping the wifi connect alive/connected)
+def update_timezone_params():
+    """Update timezone parameters from API if needed, with fallback to cached data"""
+    global TIME_ZONE_PARAMS, last_timezone_update
+    
+    current_time = time.time()
+    current_datetime = time.localtime()
+    
+    # Check if we need to update (once per day at 2am, or if params are empty)
+    should_update = (
+        len(TIME_ZONE_PARAMS) == 0 or  # No cached data
+        (current_datetime[3] == 2 and current_datetime[4] < 5 and  # It's 2am-ish
+         (current_time - last_timezone_update) > timezone_update_interval)  # Haven't updated today
+    )
+    
+    if should_update:
+        new_params = fetch_timezone_data()
+        if new_params:
+            TIME_ZONE_PARAMS = new_params
+            last_timezone_update = current_time
+        elif len(TIME_ZONE_PARAMS) == 0:
+            # Fallback to GMT if we have no data at all
+            print(f"Using GMT fallback for timezone (requested: {TIMEZONE})")
+            TIME_ZONE_PARAMS = {
+                "offset_hours": 0,
+                "offset_mins": 0,
+                "offset_multiplier": 1,
+                "utc_offset": "+00:00",
+                "dst": False,
+                "timezone": TIMEZONE,
+                "abbreviation": "GMT"
+            }
+            last_timezone_update = current_time
+
+def get_gateway_ip():
+    """Get the gateway IP address from network config"""
+    global gateway_ip
+    if wlan and wlan.isconnected():
+        config = wlan.ifconfig()
+        gateway_ip = config[2]  # Gateway is the 3rd element
+        print(f"Gateway IP: {gateway_ip}")
+        return gateway_ip
+    return None
+
+def send_keepalive():
+    """Send ARP request to gateway to keep connection alive"""
+    global last_keepalive
+    
+    if not gateway_ip:
+        return False
+        
+    try:
+        # Simple ping to gateway - more reliable than ARP on Pico W
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        # Send a small UDP packet to gateway (will likely be dropped but keeps connection alive)
+        s.sendto(b'keepalive', (gateway_ip, 1234))
+        s.close()
+        last_keepalive = time.time()
+        print("Keepalive sent to gateway")
+        return True
+    except Exception as e:
+        print(f"Keepalive failed: {e}")
+        return False
+
+def check_wifi_connection():
+    """Check WiFi connection less frequently and handle reconnection"""
+    global last_wifi_check, wifi_retry_count
+    
+    current_time = time.time()
+    
+    # Only check WiFi every wifi_check_interval seconds
+    if current_time - last_wifi_check < wifi_check_interval:
+        return True
+    
+    last_wifi_check = current_time
+    
+    if wlan and wlan.isconnected():
+        # Only log occasionally to reduce spam
+        if (current_time - last_wifi_check) < 5:  # Only log on the actual check
+            print("WiFi still connected")
+        wifi_retry_count = 0  # Reset retry count on successful check
+        return True
+    else:
+        print("WiFi disconnected, attempting reconnection...")
+        return reconnect_wifi()
+
+def reconnect_wifi():
+    """Attempt to reconnect to WiFi with exponential backoff"""
+    global wifi_retry_count, wlan
+    
+    wifi_retry_count += 1
+    
+    if wifi_retry_count > max_wifi_retries:
+        print(f"Max WiFi retries ({max_wifi_retries}) exceeded, will try again later")
+        return False
+    
+    try:
+        if not wlan:
+            wlan = network.WLAN(network.STA_IF)
+        
+        if not wlan.active():
+            wlan.active(True)
+            time.sleep(2)
+        
+        # Scan and connect to known networks
+        ssid_list = wlan.scan()
+        for network_info in ssid_list:
+            network_name = network_info[0].decode('utf-8')
+            if network_name in dict_of_wifi:
+                print(f'Attempting to connect to {network_name}')
+                displayConnecting(strip)
+                
+                wlan.connect(network_name, dict_of_wifi[network_name])
+                
+                # Wait for connection with timeout
+                for _ in range(20):  # 10 second timeout
+                    if wlan.isconnected():
+                        print('WiFi reconnected successfully')
+                        print('Network config:', wlan.ifconfig())
+                        
+                        # Update NTP time
+                        try:
+                            ntptime.settime()
+                            print("NTP time updated")
+                        except Exception as e:
+                            print(f"NTP update failed: {e}")
+                        
+                        # Get gateway IP and update timezone on initial connection
+                        get_gateway_ip()
+                        update_timezone_params()
+                        
+                        strip.clear()
+                        strip.show()
+                        wifi_retry_count = 0
+                        return True
+                    time.sleep(0.5)
+                
+                print(f'Failed to connect to {network_name}')
+                break
+        
+        print('No known networks found or connection failed')
+        return False
+        
+    except Exception as e:
+        print(f"WiFi reconnection error: {e}")
+        return False
+
 def connectToWifi():
+    """Initial WiFi connection setup"""
+    global wlan
+    
     wlan = network.WLAN(network.STA_IF)
-    reconnected = False
+    
     if not wlan.active():
         wlan.active(True)
-    i = 1
-    if not wlan.isconnected():
-        for _ in range(10):
-            #check available WiFi and try to connect
-            #to WiFi specified in dict_of_wifi if available
-            ssid = wlan.scan()
-            for x in ssid:
-                for wifi_ssid in dict_of_wifi:
-                    if wifi_ssid in str(x):
-                        displayConnecting(strip)
-                        wlan.connect(wifi_ssid, dict_of_wifi[wifi_ssid])
-                        print('Trying ' + str(wifi_ssid))
-                        time.sleep(10)
-                        reconnected = True
-                        break
-                    else:
-                        pass
-            i += 1
-            if wlan.isconnected():
-                print('Connected to wifi')
-                break
-            time.sleep(10)
-        else:
-            print('Failed to connect to wifi')
-            raise Exception("Could not connect to Wifi using all known network credentials")
-    print('network config:', wlan.ifconfig())
-    if(reconnected):
-        # Sort out time with NTP (otherwise board will default to a weird date and time, which is inconvenient)
-        ntptime.settime()
-        TIME_ZONE_PARAMS = getTimeZoneOffsets()
-        strip.clear()
-        strip.show()
-    return reconnected
+        time.sleep(2)
+    
+    if wlan.isconnected():
+        print('Already connected to WiFi')
+        print('Network config:', wlan.ifconfig())
+        get_gateway_ip()
+        update_timezone_params()
+        return False
+    
+    # Initial connection attempt
+    success = reconnect_wifi()
+    if not success:
+        raise Exception("Could not connect to WiFi using all known network credentials")
+    
+    return True
 
-def calc_pixel_location(time: str):
-    # Incoming prices will be raw from Octopus and will be in UTC, so we need to apply the timezone offset so it represents the correct time according to where the clock is located
-    price_hour = int(time[11:13]) + (TIME_ZONE_PARAMS["offset_hours"] * TIME_ZONE_PARAMS["offset_multiplier"])
-    # Because our time correction can push us into the next day, check and subtract 24 hours to rebase the time to the next day
+def calc_pixel_location(time_str: str):
+    """Calculate pixel location on clock face from UTC time string"""
+    # Apply timezone offset to UTC time
+    price_hour = int(time_str[11:13]) + (TIME_ZONE_PARAMS["offset_hours"] * TIME_ZONE_PARAMS["offset_multiplier"])
+    price_minute = int(time_str[14:16]) + (TIME_ZONE_PARAMS["offset_mins"] * TIME_ZONE_PARAMS["offset_multiplier"])
+    
+    # Handle day overflow
     if price_hour >= 24:
         price_hour -= 24
-    price_minute = int(time[14:16]) + (TIME_ZONE_PARAMS["offset_mins"] * TIME_ZONE_PARAMS["offset_multiplier"])
-    if(price_hour >= 12):
+    elif price_hour < 0:
+        price_hour += 24
+    
+    # Convert to 12-hour format
+    if price_hour >= 12:
         price_hour -= 12
-    if(price_minute > 0):
-        price_minute = 1
-    return (price_hour * 2) + price_minute
+    
+    # Convert minutes to half-hour slots (0 or 1)
+    minute_slot = 1 if price_minute >= 30 else 0
+    
+    return (price_hour * 2) + minute_slot
 
 def calc_pixel_colour(price: float):
+    """Calculate pixel colour based on price thresholds"""
     segment = round(((high_price - good_price) / 3), 2)
-    # Segment the difference between high and good price and graduate that evenly across 3 colours - this is the 'default' colour and can be overridden by the next block
-    if(price >= (high_price - segment)):
+    
+    # Default graduated colors between good and high price
+    if price >= (high_price - segment):
         pixel_colour = orange
-    elif(price >= (high_price - (segment * 2))):
+    elif price >= (high_price - (segment * 2)):
         pixel_colour = yellow
     else:
         pixel_colour = chartreuse
-    if(price >= high_price):
+    
+    # Override with threshold colors
+    if price >= high_price:
         pixel_colour = red
-    elif(price <= 0):
+    elif price <= 0:
         pixel_colour = blue
-    elif(price <= amazing_price):
+    elif price <= amazing_price:
         pixel_colour = cyan
-    elif(price <= good_price):
+    elif price <= good_price:
         pixel_colour = green
+    
     return pixel_colour
 
 def download_latest_prices(url: str):
+    """Download latest prices with better error handling"""
     displayDownloading(strip)
-    print("Fetching data from %s" % url)
+    print(f"Fetching data from {url}")
     print("-" * 40)
-    response = requests.get(url)
-    price_info = response.json()
-    current_price_index = next((index for (index, price) in enumerate(price_info["results"]) if price["valid_from"] == target_datetime))
-    upcoming_price_indices = range(current_price_index, 0, -1)                
-    upcoming_prices = []
-    for price_index in upcoming_price_indices:
-        upcoming_prices.append(price_info["results"][price_index].copy())
-    del(price_info)
-    response.close()
-    return upcoming_prices
+    
+    try:
+        response = requests.get(url)
+        price_info = response.json()
+        
+        # Find current price index
+        current_price_index = None
+        for index, price in enumerate(price_info["results"]):
+            if price["valid_from"] == target_datetime:
+                current_price_index = index
+                break
+        
+        if current_price_index is None:
+            print("Warning: Current time slot not found in price data")
+            current_price_index = 0
+        
+        # Get upcoming prices (reversed order - newest first)
+        upcoming_price_indices = range(current_price_index, max(0, current_price_index - prices_look_ahead), -1)
+        upcoming_prices = []
+        
+        for price_index in upcoming_price_indices:
+            if price_index < len(price_info["results"]):
+                upcoming_prices.append(price_info["results"][price_index].copy())
+        
+        response.close()
+        print(f"Downloaded {len(upcoming_prices)} price entries")
+        return upcoming_prices
+        
+    except Exception as e:
+        print(f"Failed to download prices: {e}")
+        displayError(strip)
+        time.sleep(2)
+        strip.clear()
+        strip.show()
+        return []
 
-def redraw_prices(pixels: Neopixels, prices: list):
+def redraw_prices(pixels: Neopixel, prices: list):
+    """Redraw all price pixels on the clock"""
     maxindex = min(prices_look_ahead, len(prices))
     strip.clear()
+    
     for idx, price in enumerate(prices[:maxindex]):
-        print(price)
+        print(f"Price {idx}: {price['valid_from']} = {price['value_inc_vat']}p")
         set_price_pixel(pixels, price)
-        print("-"*40)
+        print("-" * 40)
+    
     pixels.show()
 
-def set_price_pixel(pixels: Neopixels, price: dict):
+def set_price_pixel(pixels: Neopixel, price: dict):
+    """Set a single price pixel"""
     pixel_location = calc_pixel_location(price["valid_from"])
     pixel_colour = calc_pixel_colour(price["value_inc_vat"])
-    print("Lighting pixel %s with %s which is for %s (TZ %s mins) at price %s" % (pixel_location, pixel_colour, price["valid_from"], ((TIME_ZONE_PARAMS["offset_mins"] + (TIME_ZONE_PARAMS["offset_hours"] * 60)) * TIME_ZONE_PARAMS["offset_multiplier"]), price["value_inc_vat"]))
+    
+    print(f"Lighting pixel {pixel_location} with {pixel_colour} for {price['valid_from']} at {price['value_inc_vat']}p")
     pixels.set_pixel(pixel_location, pixel_colour)
     
-def clear_price_pixel(pixels: Neopixels, price: dict):
+def clear_price_pixel(pixels: Neopixel, price: dict):
+    """Clear a single price pixel"""
     pixel_location = calc_pixel_location(price["valid_from"])
     pixels.set_pixel(pixel_location, pixel_off)
-    print("Switching off pixel %s which is for %s at price %s" % (pixel_location, price["valid_from"], price["value_inc_vat"]))
-    
+    print(f"Clearing pixel {pixel_location} for {price['valid_from']} at {price['value_inc_vat']}p")
+
+# Main loop
 while True:
     try:
-        # connect/reconnect to SSID
-        force_redraw = connectToWifi()
-
+        # Check WiFi connection (only every 5 minutes)
+        wifi_connected = check_wifi_connection()
+        
+        # Send keepalive if needed (only every 5 minutes)
+        current_time = time.time()
+        if wifi_connected and (current_time - last_keepalive) > keepalive_interval:
+            send_keepalive()
+        
+        # Get current time
         current_datetime = time.localtime()
-        current_mins = int(current_datetime[4])
+        current_mins = current_datetime[4]
         
-        current_offset = TIME_ZONE_PARAMS.get("utc_offset", None)
-        # Recheck the timezone params each day at midnight or is empty (only found in development with soft restarts)
-        if (current_datetime[3] == 0 and current_mins == 0) or len(TIME_ZONE_PARAMS) == 0:
-            TIME_ZONE_PARAMS = getTimeZoneOffsets()
-            # If the offset has changed then we need to force a re-draw of all the pixels
-            if current_offset != TIME_ZONE_PARAMS.get("utc_offset", None):
-                force_redraw = True
+        # Update timezone daily at 2am (and on startup if empty)
+        if current_datetime[3] == 2 and current_mins < 5:
+            update_timezone_params()
         
+        # Round to nearest half hour for price lookup
         if current_mins < 30:
             current_mins = 0
         else:
             current_mins = 30
 
-        target_datetime = "%s-%02d-%02dT%02d:%02d:00Z" % (current_datetime[0], current_datetime[1], current_datetime[2], current_datetime[3], current_mins )
+        target_datetime = f"{current_datetime[0]}-{current_datetime[1]:02d}-{current_datetime[2]:02d}T{current_datetime[3]:02d}:{current_mins:02d}:00Z"
 
-        print("Target Time from data = %s (which is UTC), %s in cache" % (target_datetime, len(upcoming_prices)))
+        # Only log target time when something interesting happens
+        if len(upcoming_prices) == 0 or (len(upcoming_prices) > 0 and target_datetime != upcoming_prices[0]["valid_from"]):
+            print(f"Target Time from data = {target_datetime} (UTC), {len(upcoming_prices)} in cache")
         
-        if(len(upcoming_prices) > 0 and target_datetime != upcoming_prices[0]["valid_from"]):
-            latest_price_index = min(prices_look_ahead, len(upcoming_prices))
-            set_price_pixel(strip, upcoming_prices[latest_price_index])
+        # Update pixel display if time has moved to next slot
+        if len(upcoming_prices) > 0 and target_datetime != upcoming_prices[0]["valid_from"]:
+            # Add new pixel for future price if available
+            if len(upcoming_prices) > prices_look_ahead:
+                set_price_pixel(strip, upcoming_prices[prices_look_ahead])
+            
+            # Clear the old current price pixel
             clear_price_pixel(strip, upcoming_prices[0])
             strip.show()
+            
+            # Remove the old price from cache
             upcoming_prices.pop(0)
             
-        if((len(upcoming_prices) < prices_look_ahead and int(current_datetime[4]) in (0, 30)) or force_redraw):
-            upcoming_prices = download_latest_prices(STANDARD_RATES_URL)
-            redraw_prices(strip, upcoming_prices)
+        # Download new prices if cache is low and we're connected, or on 0/30 minute marks
+        if wifi_connected and ((len(upcoming_prices) < prices_look_ahead and current_mins in (0, 30)) or len(upcoming_prices) == 0):
+            new_prices = download_latest_prices(STANDARD_RATES_URL)
+            if new_prices:  # Only update if download was successful
+                upcoming_prices = new_prices
+                redraw_prices(strip, upcoming_prices)
             
-        #  delays for 30s
+        # Main loop delay - back to 30s since we're not constantly checking WiFi
         time.sleep(30)
-    # pylint: disable=broad-except
+        
     except Exception as e:
-        print("Error:\n", sys.print_exception(e))
+        print("Error:")
+        sys.print_exception(e)
         displayError(strip)
         print("Resetting microcontroller in 10 seconds")
         time.sleep(10)
